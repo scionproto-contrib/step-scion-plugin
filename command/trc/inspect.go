@@ -1,4 +1,4 @@
-// Copyright 2024 Anapaya Systems
+// Copyright 2026 Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,21 +19,21 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/scrypto/cms/protocol"
 	"github.com/scionproto/scion/pkg/scrypto/cppki"
 	"github.com/scionproto/scion/private/app/command"
+
+	"github.com/scionproto-contrib/step-scion-plugin/private/app"
+	"github.com/scionproto-contrib/step-scion-plugin/private/inspect"
 )
 
 const (
@@ -50,36 +50,41 @@ func NewInspectCmd(pather command.Pather) *cobra.Command {
 	}
 
 	cmd := &cobra.Command{
-		Use:     "inspect <trc-file> ",
+		Use:     "inspect [trc-file]",
 		Aliases: []string{"human", "print", "show"},
-		Short:   "print TRC details in a human readable format",
+		Short:   "Print the contents of a TRC in a human-readable format",
 		Example: fmt.Sprintf(`  %[1]s inspect ISD1-B1-S1.pld.der
-  %[1]s inspect ISD1-B1-S1.trc`, pather.CommandPath()),
-		Long: `prints the details of a TRC or partial TRC in a human- or machine-readable fromat.
+  %[1]s inspect --format json ISD1-B1-S1.trc
+  %[1]s inspect --predecessor ISD1-B1-S1.trc ISD1-B1-S2.trc`, pather.CommandPath()),
+		Long: `Print the contents of a TRC in a human- or machine-readable format.
 
-Beware: TRCs are never verified. Always verify a TRC before relying on the output
-of this command.
+The input can be a TRC payload, a partially signed TRC, or a fully signed TRC,
+either PEM or DER encoded. It is read from the given file, or from standard
+input when the argument is omitted or "-".
 
-The input file can either be a TRC payload, a partial TRC with some signatures,
-or a fully signed TRC. To read from standard input, specify "-" as the file name.
+The output is written to standard output as YAML (default) or JSON, selected
+with --format. When standard output is a terminal, the output is syntax
+highlighted.
 
-By default, this command attempts to handle decoding errors gracefully. To
-return an error if parts of a TRC fail to decode, enable the strict mode.
-`,
-		Args: cobra.ExactArgs(1),
+The purpose of each signature (vote, new voter, or root acknowledgement) can
+only be determined relative to the predecessor TRC. Provide it with
+--predecessor to include the signature purpose in the output.
+
+By default, decoding errors are reported inline in the output so that the
+readable parts are still shown. Use --strict to fail on the first error
+instead.
+
+Beware: this command does not verify the TRC. Always verify a TRC with
+'trc verify' before relying on its contents.`,
+		Args: atMostOneInput,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			encoder, err := getEncoder(cmd.OutOrStdout(), flags.format)
-			if err != nil {
-				return err
+			if flags.format != "yaml" && flags.format != "yml" && flags.format != "json" {
+				return fmt.Errorf("format not supported: %s", flags.format)
 			}
 			cmd.SilenceUsage = true
+			rep := app.NewReportForCmd(cmd)
 
-			raw, err := func() ([]byte, error) {
-				if args[0] == "-" {
-					return io.ReadAll(cmd.InOrStdin())
-				}
-				return os.ReadFile(args[0])
-			}()
+			raw, err := app.ReadFileOrStdin(inputFile(args), cmd.InOrStdin())
 			if err != nil {
 				return fmt.Errorf("reading input: %w", err)
 			}
@@ -104,27 +109,18 @@ return an error if parts of a TRC fail to decode, enable the strict mode.
 			if err != nil {
 				return err
 			}
-			return encoder.Encode(h)
+			if flags.format == "json" {
+				return rep.OutJSON(h)
+			}
+			return rep.OutYAML(h)
 		},
 	}
 	cmd.Flags().StringVar(&flags.format, "format", "yaml", "Output format (yaml|json)")
 	cmd.Flags().BoolVar(&flags.strict, "strict", false, "Enable strict decoding mode")
 	cmd.Flags().StringVar(&flags.predecessor, "predecessor", "",
-		"Predecessor TRC (required to display signature purpose)")
+		"Predecessor TRC (required to display signature purpose)",
+	)
 	return cmd
-}
-
-func getEncoder(w io.Writer, format string) (interface{ Encode(v interface{}) error }, error) {
-	switch format {
-	case "yaml", "yml":
-		return yaml.NewEncoder(w), nil
-	case "json":
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "    ")
-		return enc, nil
-	default:
-		return nil, fmt.Errorf("format not supported: %s", format)
-	}
 }
 
 type decoded struct {
@@ -154,16 +150,16 @@ func decodeTRCorPayload(raw []byte) (decoded, error) {
 	return decoded{}, fmt.Errorf("neither TRC nor signed TRC")
 }
 
-func newTRCInfo(trc decoded, pred decoded, strict bool) (Info, error) {
+func newTRCInfo(trc decoded, pred decoded, strict bool) (inspect.TRC, error) {
 	var errs []error
-	info := Info{
+	info := inspect.TRC{
 		Version: trc.TRC.Version,
-		ID: ID{
+		ID: inspect.TRCID{
 			ISD:    trc.TRC.ID.ISD,
 			Base:   uint64(trc.TRC.ID.Base),
 			Serial: uint64(trc.TRC.ID.Serial),
 		},
-		Validity:          Validity(trc.TRC.Validity),
+		Validity:          inspect.Validity(trc.TRC.Validity),
 		NoTrustReset:      trc.TRC.NoTrustReset,
 		Votes:             trc.TRC.Votes,
 		Quorum:            trc.TRC.Quorum,
@@ -182,22 +178,22 @@ func newTRCInfo(trc decoded, pred decoded, strict bool) (Info, error) {
 			}
 			return trc.TRC.Validity.NotBefore.Add(trc.TRC.GracePeriod).UTC()
 		}(),
-		Certificates: func() []CertDesc {
-			var certs []CertDesc
+		Certificates: func() []inspect.CertDesc {
+			var certs []inspect.CertDesc
 			for i, cert := range trc.TRC.Certificates {
 				t, err := cppki.ValidateCert(trc.TRC.Certificates[0])
 				if err != nil {
-					certs = append(certs, CertDesc{Error: err.Error()})
+					certs = append(certs, inspect.CertDesc{Error: err.Error()})
 					errs = append(errs, fmt.Errorf("classifying certificate %d: %w", i, err))
 					continue
 				}
-				certs = append(certs, CertDesc{
+				certs = append(certs, inspect.CertDesc{
 					CommonName:   cert.Subject.CommonName,
 					IA:           extractIA(cert.Subject),
 					SerialNumber: fmt.Sprintf("% X", cert.SerialNumber.Bytes()),
 					Type:         t.String(),
 					Index:        i,
-					Validity: Validity{
+					Validity: inspect.Validity{
 						NotBefore: cert.NotBefore,
 						NotAfter:  cert.NotAfter,
 					},
@@ -205,7 +201,7 @@ func newTRCInfo(trc decoded, pred decoded, strict bool) (Info, error) {
 			}
 			return certs
 		}(),
-		Signatures: func() []SignerInfo {
+		Signatures: func() []inspect.SignerInfo {
 			if trc.Signed == nil {
 				return nil
 			}
@@ -215,11 +211,11 @@ func newTRCInfo(trc decoded, pred decoded, strict bool) (Info, error) {
 				}
 				return pred.TRC.Certificates
 			}()
-			var signers []SignerInfo
+			var signers []inspect.SignerInfo
 			for i, info := range trc.Signed.SignerInfos {
 				d, err := newSignerInfo(info, predCerts)
 				if err != nil {
-					signers = append(signers, SignerInfo{Error: err.Error()})
+					signers = append(signers, inspect.SignerInfo{Error: err.Error()})
 					errs = append(errs, fmt.Errorf("decoding signer info %d: %w", i, err))
 					continue
 				}
@@ -229,35 +225,35 @@ func newTRCInfo(trc decoded, pred decoded, strict bool) (Info, error) {
 		}(),
 	}
 	if err := errors.Join(errs...); err != nil && strict {
-		return Info{}, err
+		return inspect.TRC{}, err
 	}
 	return info, nil
 }
 
-func newSignerInfo(info protocol.SignerInfo, certs []*x509.Certificate) (SignerInfo, error) {
+func newSignerInfo(info protocol.SignerInfo, certs []*x509.Certificate) (inspect.SignerInfo, error) {
 	if info.SID.Class != asn1.ClassUniversal || info.SID.Tag != asn1.TagSequence {
-		return SignerInfo{}, errors.New("unsupported signer info type")
+		return inspect.SignerInfo{}, errors.New("unsupported signer info type")
 	}
 	var isn protocol.IssuerAndSerialNumber
 	if rest, err := asn1.Unmarshal(info.SID.FullBytes, &isn); err != nil {
-		return SignerInfo{}, err
+		return inspect.SignerInfo{}, err
 	} else if len(rest) > 0 {
-		return SignerInfo{}, errors.New("trailing data")
+		return inspect.SignerInfo{}, errors.New("trailing data")
 	}
 	var issuer pkix.RDNSequence
 	if rest, err := asn1.Unmarshal(isn.Issuer.FullBytes, &issuer); err != nil {
-		return SignerInfo{}, err
+		return inspect.SignerInfo{}, err
 	} else if len(rest) != 0 {
-		return SignerInfo{}, errors.New("trailing data")
+		return inspect.SignerInfo{}, errors.New("trailing data")
 	}
 	signingTime, err := info.GetSigningTimeAttribute()
 	if err != nil {
-		return SignerInfo{}, err
+		return inspect.SignerInfo{}, err
 	}
 
 	var name pkix.Name
 	name.FillFromRDNSequence(&issuer)
-	return SignerInfo{
+	return inspect.SignerInfo{
 		CommonName:   name.CommonName,
 		IA:           extractIA(name),
 		SerialNumber: fmt.Sprintf("% X", isn.SerialNumber.Bytes()),

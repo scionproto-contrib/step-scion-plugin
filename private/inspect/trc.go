@@ -1,4 +1,4 @@
-// Copyright 2024 Anapaya Systems
+// Copyright 2026 Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package trc
+package inspect
 
 import (
 	"time"
@@ -20,9 +20,9 @@ import (
 	"github.com/scionproto/scion/pkg/addr"
 )
 
-type Info struct {
+type TRC struct {
 	Version           int          `yaml:"version" json:"version"`
-	ID                ID           `yaml:"id" json:"id"`
+	ID                TRCID        `yaml:"id" json:"id"`
 	Validity          Validity     `yaml:"validity" json:"validity"`
 	GracePeriod       string       `yaml:"graceperiod,omitempty" json:"graceperiod,omitempty"`
 	GracePeriodEnd    time.Time    `yaml:"graceperiod_end,omitempty" json:"graceperiod_end,omitempty"`
@@ -36,7 +36,7 @@ type Info struct {
 	Signatures        []SignerInfo `yaml:"signatures,omitempty" json:"signatures,omitempty"`
 }
 
-type ID struct {
+type TRCID struct {
 	ISD    addr.ISD `yaml:"isd" json:"isd"`
 	Base   uint64   `yaml:"base_number" json:"base_number"`
 	Serial uint64   `yaml:"serial_number" json:"serial_number"`
